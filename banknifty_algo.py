@@ -159,9 +159,12 @@ class BankNiftyBreakoutAlgo:
         }
 
     def _cpr_type(self, width_pct: float) -> str:
-        if width_pct <= self.cfg.narrow_cpr_threshold_pct:
+        narrow_threshold = self.cfg.narrow_cpr_threshold_pct
+        normal_threshold = getattr(self.cfg, "normal_cpr_threshold_pct", 0.50)
+
+        if width_pct <= narrow_threshold:
             return "NARROW"
-        if width_pct <= self.cfg.narrow_cpr_threshold_pct * 2.5:
+        if width_pct <= normal_threshold:
             return "NORMAL"
         return "WIDE"
 
