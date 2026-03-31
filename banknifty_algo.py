@@ -29,9 +29,11 @@ import signal
 import sys
 import time
 from dataclasses import asdict, dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, TypeVar
 
 from kiteconnect import KiteConnect
+
+T = TypeVar("T")
 
 
 @dataclass
@@ -72,6 +74,13 @@ class StrategyConfig:
 
     # polling
     poll_interval_seconds: int = 5
+    exit_poll_interval_seconds: int = 1
+
+    # reliability controls
+    api_retry_attempts: int = 3
+    api_retry_delay_seconds: float = 0.6
+    order_fill_timeout_seconds: int = 12
+    order_poll_interval_seconds: float = 0.5
 
 
 @dataclass
@@ -99,6 +108,7 @@ class BankNiftyBreakoutAlgo:
         self.kite.set_access_token(cfg.access_token)
         self.state = self._load_state()
         self._instrument_cache: Optional[List[Dict[str, Any]]] = None
+        self._exit_in_progress = False
 
     # ---------- utility ----------
     def _setup_logging(self) -> None:
@@ -158,10 +168,34 @@ class BankNiftyBreakoutAlgo:
     def _lot_qty(self) -> int:
         return self.cfg.qty_per_lot * self.cfg.lots
 
+    def _with_retry(self, fn: Callable[[], T], action: str) -> T:
+        last_exc: Optional[Exception] = None
+        for attempt in range(1, self.cfg.api_retry_attempts + 1):
+            try:
+                return fn()
+            except Exception as exc:
+                last_exc = exc
+                if attempt == self.cfg.api_retry_attempts:
+                    break
+                sleep_s = self.cfg.api_retry_delay_seconds * attempt
+                logging.warning(
+                    "API retry %s/%s failed for %s: %s. Sleeping %.2fs before retry.",
+                    attempt,
+                    self.cfg.api_retry_attempts,
+                    action,
+                    exc,
+                    sleep_s,
+                )
+                time.sleep(sleep_s)
+        raise RuntimeError(f"{action} failed after retries: {last_exc}") from last_exc
+
     # ---------- market data ----------
     def _instruments(self) -> List[Dict[str, Any]]:
         if self._instrument_cache is None:
-            self._instrument_cache = self.kite.instruments()
+            self._instrument_cache = self._with_retry(
+                lambda: self.kite.instruments(),
+                "fetch instruments",
+            )
         return self._instrument_cache
 
     def _instrument_by_exchange_symbol(self, exchange: str, tradingsymbol: str) -> Dict[str, Any]:
@@ -181,7 +215,10 @@ class BankNiftyBreakoutAlgo:
         to_dt: dt.datetime,
         interval: str,
     ) -> List[Dict[str, Any]]:
-        return self.kite.historical_data(token, from_dt, to_dt, interval, continuous=False, oi=False)
+        return self._with_retry(
+            lambda: self.kite.historical_data(token, from_dt, to_dt, interval, continuous=False, oi=False),
+            f"fetch historical_data token={token} interval={interval}",
+        )
 
     def _get_previous_day_ohlc(self) -> Dict[str, float]:
         token = self._index_token()
@@ -216,7 +253,10 @@ class BankNiftyBreakoutAlgo:
 
     def _ltp(self, exchange: str, symbol: str) -> float:
         key = f"{exchange}:{symbol}"
-        return self.kite.ltp([key])[key]["last_price"]
+        return self._with_retry(
+            lambda: self.kite.ltp([key])[key]["last_price"],
+            f"fetch ltp {key}",
+        )
 
     def _index_ltp(self) -> float:
         return self._ltp(self.cfg.index_exchange, self.cfg.index_symbol)
@@ -248,28 +288,69 @@ class BankNiftyBreakoutAlgo:
 
     # ---------- trading ----------
     def _place_market_buy(self, tradingsymbol: str, qty: int) -> str:
-        return self.kite.place_order(
-            variety=self.kite.VARIETY_REGULAR,
-            exchange=self.cfg.option_exchange,
-            tradingsymbol=tradingsymbol,
-            transaction_type=self.kite.TRANSACTION_TYPE_BUY,
-            quantity=qty,
-            product=self.kite.PRODUCT_MIS,
-            order_type=self.kite.ORDER_TYPE_MARKET,
-            validity=self.kite.VALIDITY_DAY,
+        return self._with_retry(
+            lambda: self.kite.place_order(
+                variety=self.kite.VARIETY_REGULAR,
+                exchange=self.cfg.option_exchange,
+                tradingsymbol=tradingsymbol,
+                transaction_type=self.kite.TRANSACTION_TYPE_BUY,
+                quantity=qty,
+                product=self.kite.PRODUCT_MIS,
+                order_type=self.kite.ORDER_TYPE_MARKET,
+                validity=self.kite.VALIDITY_DAY,
+            ),
+            f"place market buy {tradingsymbol}",
         )
 
     def _place_market_sell(self, tradingsymbol: str, qty: int) -> str:
-        return self.kite.place_order(
-            variety=self.kite.VARIETY_REGULAR,
-            exchange=self.cfg.option_exchange,
-            tradingsymbol=tradingsymbol,
-            transaction_type=self.kite.TRANSACTION_TYPE_SELL,
-            quantity=qty,
-            product=self.kite.PRODUCT_MIS,
-            order_type=self.kite.ORDER_TYPE_MARKET,
-            validity=self.kite.VALIDITY_DAY,
+        return self._with_retry(
+            lambda: self.kite.place_order(
+                variety=self.kite.VARIETY_REGULAR,
+                exchange=self.cfg.option_exchange,
+                tradingsymbol=tradingsymbol,
+                transaction_type=self.kite.TRANSACTION_TYPE_SELL,
+                quantity=qty,
+                product=self.kite.PRODUCT_MIS,
+                order_type=self.kite.ORDER_TYPE_MARKET,
+                validity=self.kite.VALIDITY_DAY,
+            ),
+            f"place market sell {tradingsymbol}",
         )
+
+    def _order_by_id(self, order_id: str) -> Optional[Dict[str, Any]]:
+        orders = self._with_retry(lambda: self.kite.orders(), "fetch orderbook")
+        for order in reversed(orders):
+            if order.get("order_id") == order_id:
+                return order
+        return None
+
+    def _wait_for_order_terminal(self, order_id: str, side: str) -> Dict[str, Any]:
+        deadline = time.time() + self.cfg.order_fill_timeout_seconds
+        last_status = "UNKNOWN"
+        while time.time() <= deadline:
+            order = self._order_by_id(order_id)
+            if not order:
+                time.sleep(self.cfg.order_poll_interval_seconds)
+                continue
+            status = (order.get("status") or "").upper()
+            if status:
+                last_status = status
+            if status == "COMPLETE":
+                logging.info(
+                    "%s order complete | order_id=%s avg_price=%s filled=%s pending=%s",
+                    side,
+                    order_id,
+                    order.get("average_price"),
+                    order.get("filled_quantity"),
+                    order.get("pending_quantity"),
+                )
+                return order
+            if status in {"REJECTED", "CANCELLED"}:
+                raise RuntimeError(
+                    f"{side} order {order_id} {status}: {order.get('status_message') or order.get('status_message_raw')}"
+                )
+            time.sleep(self.cfg.order_poll_interval_seconds)
+        raise RuntimeError(f"{side} order {order_id} not complete before timeout (last_status={last_status})")
 
     def _entry_signal(self, candle930: Dict[str, Any], day_20ma: float, spot_ltp: float) -> Optional[str]:
         high_trigger = candle930["high"] + self.cfg.breakout_buffer_points
@@ -288,7 +369,11 @@ class BankNiftyBreakoutAlgo:
 
         qty = self._lot_qty()
         order_id = self._place_market_buy(symbol, qty)
-        premium_entry = self._ltp(self.cfg.option_exchange, symbol)
+        entry_order = self._wait_for_order_terminal(order_id, "ENTRY")
+        premium_entry = float(entry_order.get("average_price") or 0.0)
+        if premium_entry <= 0:
+            premium_entry = self._ltp(self.cfg.option_exchange, symbol)
+            logging.warning("ENTRY avg_price missing; fallback to LTP %.2f", premium_entry)
 
         if option_type == "CE":
             sl_spot = spot_ltp - self.cfg.spot_sl_points
@@ -324,22 +409,42 @@ class BankNiftyBreakoutAlgo:
         )
 
     def _exit_trade(self, reason: str) -> None:
-        if not self.state.symbol:
+        if not self.state.symbol or self.state.exit_time or self._exit_in_progress:
             return
 
+        self._exit_in_progress = True
         qty = self._lot_qty()
-        exit_order_id = self._place_market_sell(self.state.symbol, qty)
-        self.state.exit_time = self._now().isoformat(timespec="seconds")
-        self.state.exit_reason = f"{reason} | exit_order={exit_order_id}"
-        self._save_state()
-        logging.info("EXIT %s | %s", reason, self.state.symbol)
+        try:
+            exit_order_id = self._place_market_sell(self.state.symbol, qty)
+            exit_order = self._wait_for_order_terminal(exit_order_id, "EXIT")
+            avg_exit = float(exit_order.get("average_price") or 0.0)
+            self.state.exit_time = self._now().isoformat(timespec="seconds")
+            self.state.exit_reason = (
+                f"{reason} | exit_order={exit_order_id} | avg_exit={avg_exit:.2f}"
+                if avg_exit > 0
+                else f"{reason} | exit_order={exit_order_id}"
+            )
+            self._save_state()
+            logging.info(
+                "EXIT %s | %s | order_id=%s | avg_exit=%.2f",
+                reason,
+                self.state.symbol,
+                exit_order_id,
+                avg_exit,
+            )
+        finally:
+            self._exit_in_progress = False
 
     def _should_exit_on_rule(self) -> Optional[str]:
         if not self.state.symbol:
             return None
 
-        spot = self._index_ltp()
-        premium = self._ltp(self.cfg.option_exchange, self.state.symbol)
+        try:
+            spot = self._index_ltp()
+            premium = self._ltp(self.cfg.option_exchange, self.state.symbol)
+        except Exception as exc:
+            logging.error("Exit check data fetch failed: %s", exc)
+            return None
 
         # Spot SL/Target
         if self.state.option_type == "CE":
@@ -403,7 +508,10 @@ class BankNiftyBreakoutAlgo:
 
             # hard stop window
             if now >= self.cfg.force_exit_time and self.state.traded and not self.state.exit_time:
-                self._exit_trade("FORCE_EXIT_15_20")
+                try:
+                    self._exit_trade("FORCE_EXIT_15_20")
+                except Exception as exc:
+                    logging.error("Force exit failed: %s", exc)
 
             if now >= self.cfg.session_close_time:
                 logging.info("Session close 15:30 reached. Exiting script.")
@@ -430,17 +538,33 @@ class BankNiftyBreakoutAlgo:
                     continue
 
             if not self.state.traded:
-                spot = self._index_ltp()
+                try:
+                    spot = self._index_ltp()
+                except Exception as exc:
+                    logging.error("Spot LTP fetch failed during entry scan: %s", exc)
+                    time.sleep(self.cfg.poll_interval_seconds)
+                    continue
                 signal_type = self._entry_signal(candle930, day_20ma, spot)
                 if signal_type:
-                    self._enter_trade(signal_type, spot)
+                    try:
+                        self._enter_trade(signal_type, spot)
+                    except Exception as exc:
+                        logging.error("Entry failed for %s: %s", signal_type, exc)
 
             else:
                 reason = self._should_exit_on_rule()
                 if reason and not self.state.exit_time:
-                    self._exit_trade(reason)
+                    try:
+                        self._exit_trade(reason)
+                    except Exception as exc:
+                        logging.critical("Rule exit failed: %s | reason=%s", exc, reason)
 
-            time.sleep(self.cfg.poll_interval_seconds)
+            sleep_seconds = (
+                self.cfg.exit_poll_interval_seconds
+                if self.state.traded and not self.state.exit_time
+                else self.cfg.poll_interval_seconds
+            )
+            time.sleep(sleep_seconds)
 
 
 def load_config_from_env() -> StrategyConfig:
