@@ -70,7 +70,7 @@ class StrategyConfig:
     premium_target_points: float = 70.0
 
     # CPR filter tuning
-    narrow_cpr_threshold_pct: float = 0.25  # width % of previous-day range
+    narrow_cpr_threshold_pct: float = 0.30  # width % of pivot (excel-aligned)
 
     # polling
     poll_interval_seconds: int = 5
@@ -148,8 +148,8 @@ class BankNiftyBreakoutAlgo:
         bc = (prev_h + prev_l) / 2.0
         tc = 2 * pivot - bc
         width = abs(tc - bc)
-        day_range = max(prev_h - prev_l, 0.01)
-        width_pct = (width / day_range) * 100
+        pivot_for_width = max(abs(pivot), 0.01)
+        width_pct = (width / pivot_for_width) * 100
         return {
             "pivot": pivot,
             "bc": min(bc, tc),
@@ -236,9 +236,9 @@ class BankNiftyBreakoutAlgo:
         start = end - dt.timedelta(days=60)
         candles = self._get_historical(token, start, end, "day")
         closes = [c["close"] for c in candles if c["close"] is not None]
-        if len(closes) < 20:
+        if len(closes) < 21:
             raise RuntimeError("Not enough day candles for 20MA")
-        return sum(closes[-20:]) / 20.0
+        return sum(closes[-21:-1]) / 20.0
 
     def _get_930_candle(self) -> Dict[str, Any]:
         token = self._index_token()
