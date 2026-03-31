@@ -501,6 +501,7 @@ class BankNiftyBreakoutAlgo:
         signal.signal(signal.SIGTERM, _shutdown)
 
         candle930: Optional[Dict[str, Any]] = None
+        one_trade_done_logged = False
 
         while True:
             now = self._now().time()
@@ -522,6 +523,9 @@ class BankNiftyBreakoutAlgo:
 
             # one trade/day restriction
             if self.state.traded and self.state.exit_time:
+                if not one_trade_done_logged:
+                    logging.info("One trade per day completed. No further entries for today.")
+                    one_trade_done_logged = True
                 time.sleep(self.cfg.poll_interval_seconds)
                 continue
 
