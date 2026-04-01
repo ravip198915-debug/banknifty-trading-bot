@@ -290,7 +290,9 @@ class BankNiftyBreakoutAlgo:
         return candidates[0]
 
     # ---------- trading ----------
-    def _place_market_buy(self, tradingsymbol: str, qty: int) -> str:
+    def _place_limit_buy(self, tradingsymbol: str, qty: int) -> str:
+        ltp = self._ltp(self.cfg.option_exchange, tradingsymbol)
+        price = round(ltp + 1, 1)
         return self._with_retry(
             lambda: self.kite.place_order(
                 variety=self.kite.VARIETY_REGULAR,
@@ -299,13 +301,16 @@ class BankNiftyBreakoutAlgo:
                 transaction_type=self.kite.TRANSACTION_TYPE_BUY,
                 quantity=qty,
                 product=self.kite.PRODUCT_MIS,
-                order_type=self.kite.ORDER_TYPE_MARKET,
+                order_type=self.kite.ORDER_TYPE_LIMIT,
+                price=price,
                 validity=self.kite.VALIDITY_DAY,
             ),
-            f"place market buy {tradingsymbol}",
+            f"place limit buy {tradingsymbol}",
         )
 
-    def _place_market_sell(self, tradingsymbol: str, qty: int) -> str:
+    def _place_limit_sell(self, tradingsymbol: str, qty: int) -> str:
+        ltp = self._ltp(self.cfg.option_exchange, tradingsymbol)
+        price = round(ltp - 1, 1)
         return self._with_retry(
             lambda: self.kite.place_order(
                 variety=self.kite.VARIETY_REGULAR,
@@ -314,10 +319,11 @@ class BankNiftyBreakoutAlgo:
                 transaction_type=self.kite.TRANSACTION_TYPE_SELL,
                 quantity=qty,
                 product=self.kite.PRODUCT_MIS,
-                order_type=self.kite.ORDER_TYPE_MARKET,
+                order_type=self.kite.ORDER_TYPE_LIMIT,
+                price=price,
                 validity=self.kite.VALIDITY_DAY,
             ),
-            f"place market sell {tradingsymbol}",
+            f"place limit sell {tradingsymbol}",
         )
 
     def _order_by_id(self, order_id: str) -> Optional[Dict[str, Any]]:
@@ -371,7 +377,7 @@ class BankNiftyBreakoutAlgo:
         symbol = instrument["tradingsymbol"]
 
         qty = self._lot_qty()
-        order_id = self._place_market_buy(symbol, qty)
+        order_id = self._place_limit_buy(symbol, qty)
         entry_order = self._wait_for_order_terminal(order_id, "ENTRY")
         premium_entry = float(entry_order.get("average_price") or 0.0)
         if premium_entry <= 0:
@@ -418,7 +424,7 @@ class BankNiftyBreakoutAlgo:
         self._exit_in_progress = True
         qty = self._lot_qty()
         try:
-            exit_order_id = self._place_market_sell(self.state.symbol, qty)
+            exit_order_id = self._place_limit_sell(self.state.symbol, qty)
             exit_order = self._wait_for_order_terminal(exit_order_id, "EXIT")
             avg_exit = float(exit_order.get("average_price") or 0.0)
             self.state.exit_time = self._now().isoformat(timespec="seconds")
